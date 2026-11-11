@@ -17,7 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// AGENTSTATS_E2E=1 AGENTSTATS_MCP_KEY=al_srv_... AGENTSTATS_ENDPOINT=http://localhost:3000/api/ingest/mcp go test -run E2E -v .
+// AGENTSTATS_E2E=1 AGENTSTATS_MCP_KEY=al_srv_... AGENTSTATS_URL=http://localhost:3000 go test -run E2E -v .
 func TestE2ELocal(t *testing.T) {
 	if os.Getenv("AGENTSTATS_E2E") != "1" {
 		t.Skip("set AGENTSTATS_E2E=1")

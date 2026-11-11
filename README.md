@@ -17,6 +17,8 @@ s, tracker := mcpgo.NewServer("my-server", "1.0.0", agentstats.Options{})
 // already using hooks? mcpgo.AddTo(yourHooks, agentstats.New(agentstats.Options{ServerName: "my-server"}))
 ```
 
+`agentstats.Options{FeedbackTool: true}` adds a `send_feedback` tool the SDK answers itself, so agents and users can report problems (with mcp-go and your own hooks, also call `mcpgo.AddFeedbackTool(s, tracker)`).
+
 Handles both the `initialize` handshake and the 2026-07-28 `server/discover` + per-request `_meta` client info. Measured overhead: ~0.4 µs on an 80 µs in-memory call (`go test -bench .`).
 
 ```sh

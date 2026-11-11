@@ -57,7 +57,7 @@ func run(t *testing.T, args ...string) ([]map[string]any, *body, int, string) {
 	defer srv.Close()
 	dir := t.TempDir()
 	cmd := exec.Command(binary, args...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "AGENTSTATS_CLI_KEY=al_cli_test", "AGENTSTATS_CLI_ENDPOINT=" + srv.URL, "AGENTSTATS_CLI_DIR=" + dir, "AGENTSTATS_CLI_TMP_DIR=" + dir + "-tmp"}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "AGENTSTATS_CLI_KEY=al_cli_test", "AGENTSTATS_URL=" + srv.URL, "AGENTSTATS_CLI_DIR=" + dir, "AGENTSTATS_CLI_TMP_DIR=" + dir + "-tmp"}
 	out, _ := cmd.CombinedOutput()
 	started := time.Now()
 	for time.Since(started) < 5*time.Second {
@@ -186,7 +186,7 @@ func TestPublishKey(t *testing.T) {
 	defer srv.Close()
 	dir := t.TempDir()
 	cmd := exec.Command(binary, "--version")
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "AGENTSTATS_CLI_KEY=al_cli_test", "AGENTSTATS_CLI_PUBLISH_KEY=al_sec_test", "AGENTSTATS_CLI_ENDPOINT=" + srv.URL, "AGENTSTATS_CLI_DIR=" + dir}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "AGENTSTATS_CLI_KEY=al_cli_test", "AGENTSTATS_CLI_PUBLISH_KEY=al_sec_test", "AGENTSTATS_URL=" + srv.URL, "AGENTSTATS_CLI_DIR=" + dir}
 	out, _ := cmd.CombinedOutput()
 	mu.Lock()
 	defer mu.Unlock()

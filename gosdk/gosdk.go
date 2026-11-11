@@ -8,11 +8,15 @@ package gosdk
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agentstats.io/go"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -60,6 +64,12 @@ func Middleware(t *agentstats.Tracker) mcp.Middleware {
 			if !agentstats.Tracked[method] {
 				return next(ctx, method, req)
 			}
+			// send_feedback (Options.FeedbackTool): answered here, never by the server, and not a tool call.
+			if method == "tools/call" && t.FeedbackEnabled() && !serverHasFeedback.Load() {
+				if res, ok := answerFeedback(t, req, sessionID); ok {
+					return res, nil
+				}
+			}
 			var tool string
 			if method == "tools/call" {
 				if !t.Sample() {
@@ -87,13 +97,124 @@ func Middleware(t *agentstats.Tracker) mcp.Middleware {
 			}
 			call.Auth = requestAuth(ctx, t, req)
 			if err != nil {
-				call.IsError, call.ErrorMessage, call.Err = true, err.Error(), err
+				call.IsError, call.ErrorMessage, call.Err, call.ErrorKind = true, err.Error(), err, "protocol"
+				var we *jsonrpc.Error
+				if errors.As(err, &we) {
+					code := we.Code
+					call.ErrorCode = &code
+				}
 			}
 			observe(t, method, req, res, &call)
 			t.Record(call)
+			if r, ok := res.(*mcp.ListToolsResult); ok && t.FeedbackEnabled() {
+				res = withFeedbackTool(r)
+			}
 			return res, err
 		}
 	}
+}
+
+// serverHasFeedback: the server lists a send_feedback tool of its own, so its calls are left alone.
+var serverHasFeedback atomic.Bool
+
+func answerFeedback(t *agentstats.Tracker, req mcp.Request, sessionID func(*mcp.ServerSession) string) (mcp.Result, bool) {
+	var name string
+	var args map[string]any
+	switch p := req.GetParams().(type) {
+	case *mcp.CallToolParamsRaw:
+		name = p.Name
+		_ = json.Unmarshal(p.Arguments, &args)
+	case *mcp.CallToolParams:
+		name = p.Name
+		args, _ = p.Arguments.(map[string]any)
+	}
+	if name != agentstats.FeedbackToolName {
+		return nil, false
+	}
+	var sid, cname, cversion string
+	if ss, ok := req.GetSession().(*mcp.ServerSession); ok && ss != nil {
+		sid = sessionID(ss)
+		if ip := ss.InitializeParams(); ip != nil && ip.ClientInfo != nil {
+			cname, cversion = ip.ClientInfo.Name, ip.ClientInfo.Version
+		}
+	}
+	if !t.RecordFeedback(args, sid, cname, cversion) {
+		return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: agentstats.FeedbackEmptyReply}}}, true
+	}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: agentstats.FeedbackReply}}}, true
+}
+
+// withFeedbackTool returns the tool list with send_feedback added: a copy, so the server's own list is untouched.
+func withFeedbackTool(r *mcp.ListToolsResult) *mcp.ListToolsResult {
+	if r == nil || r.NextCursor != "" {
+		return r
+	}
+	for _, tl := range r.Tools {
+		if tl != nil && tl.Name == agentstats.FeedbackToolName {
+			serverHasFeedback.Store(true)
+			return r
+		}
+	}
+	no := false
+	out := *r
+	out.Tools = append(append(make([]*mcp.Tool, 0, len(r.Tools)+1), r.Tools...), &mcp.Tool{
+		Name:        agentstats.FeedbackToolName,
+		Title:       agentstats.FeedbackToolTitle,
+		Description: agentstats.FeedbackToolDescription,
+		InputSchema: agentstats.FeedbackInputSchema(),
+		Annotations: &mcp.ToolAnnotations{Title: agentstats.FeedbackToolTitle, DestructiveHint: &no, OpenWorldHint: &no},
+	})
+	return &out
+}
+
+// resultChars is the text a result hands the model (PROTOCOL.md resultChars).
+func resultChars(res mcp.Result) *int {
+	n := 0
+	text := func(c mcp.Content) {
+		switch v := c.(type) {
+		case *mcp.TextContent:
+			n += len(v.Text)
+		case *mcp.EmbeddedResource:
+			if v.Resource != nil {
+				n += len(v.Resource.Text)
+			}
+		}
+	}
+	switch r := res.(type) {
+	case *mcp.CallToolResult:
+		if r == nil {
+			return nil
+		}
+		for _, c := range r.Content {
+			text(c)
+		}
+		if n == 0 && r.StructuredContent != nil {
+			if b, err := json.Marshal(r.StructuredContent); err == nil {
+				n = len(b)
+			}
+		}
+	case *mcp.ReadResourceResult:
+		if r == nil {
+			return nil
+		}
+		for _, c := range r.Contents {
+			if c != nil {
+				n += len(c.Text)
+			}
+		}
+	case *mcp.GetPromptResult:
+		if r == nil {
+			return nil
+		}
+		for _, m := range r.Messages {
+			if m != nil {
+				text(m.Content)
+			}
+		}
+	default:
+		return nil
+	}
+	return &n
 }
 
 // requestAuth is the sign-in summary of a request: the go-sdk's TokenInfo (set by
@@ -132,6 +253,9 @@ func observe(t *agentstats.Tracker, method string, req mcp.Request, res mcp.Resu
 			t.SetServerInfo(si.Name, si.Version, "")
 		}
 	}
+	if !call.IsError {
+		call.ResultChars = resultChars(res)
+	}
 	switch r := res.(type) {
 	case *mcp.DiscoverResult:
 		if r != nil && r.Instructions != "" {
@@ -139,7 +263,7 @@ func observe(t *agentstats.Tracker, method string, req mcp.Request, res mcp.Resu
 		}
 	case *mcp.CallToolResult:
 		if r != nil && r.IsError {
-			call.IsError = true
+			call.IsError, call.ErrorKind = true, "tool"
 			for _, c := range r.Content {
 				if tc, ok := c.(*mcp.TextContent); ok {
 					call.ErrorMessage = tc.Text

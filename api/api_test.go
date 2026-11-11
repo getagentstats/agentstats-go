@@ -45,7 +45,8 @@ func TestMiddlewareWithServeMux(t *testing.T) {
 		w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("POST /v1/users", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(201) })
-	tr := api.New(api.Options{APIKey: "al_api_test", Endpoint: ingest.URL, FlushInterval: time.Hour})
+	t.Setenv("AGENTSTATS_URL", ingest.URL)
+	tr := api.New(api.Options{APIKey: "al_api_test", FlushInterval: time.Hour})
 	srv := httptest.NewServer(api.Middleware(tr)(mux))
 	defer srv.Close()
 

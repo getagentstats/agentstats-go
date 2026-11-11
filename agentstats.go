@@ -26,16 +26,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"agentstats.io/go/internal/ingest"
 )
 
 const Version = "0.1.0"
-const defaultEndpoint = "https://agentstats.io/api/ingest/mcp"
 
 // Options configure a Tracker. Zero values fall back to environment variables and defaults.
 type Options struct {
 	APIKey     string // AGENTSTATS_MCP_KEY
 	ServerName string // defaults to the serverInfo name the server reports
-	Endpoint   string // AGENTSTATS_ENDPOINT
 	// SampleRate is the fraction of tools/call requests recorded. 0 means 1.
 	SampleRate float64
 	// DisableErrorText stops error messages being sent.
@@ -45,16 +45,23 @@ type Options struct {
 	ErrorText func(ErrorInfo) string
 	// DisableCatalog stops the tool list being sent.
 	DisableCatalog bool
-	FlushInterval  time.Duration // default 2s
-	MaxBatch       int           // default 250
-	MaxBuffer      int           // default 10000
-	Debug          bool          // AGENTSTATS_DEBUG=1
-	HTTPClient     *http.Client
+	// FeedbackTool adds a send_feedback tool to the server's tools, answered by the SDK (it never reaches
+	// your handlers), so agents can report a tool that failed them and users can pass something on.
+	// What they write is sent to AgentStats (Feedback, under the server). Off by default.
+	FeedbackTool  bool
+	FlushInterval time.Duration // default 2s
+	MaxBatch      int           // default 250
+	MaxBuffer     int           // default 10000
+	Debug         bool          // AGENTSTATS_DEBUG=1
+	HTTPClient    *http.Client
 	// AuthInfo returns the OAuth client id and granted scopes of the request's validated access
 	// token, for transports that put them in the context (mcp-go's WithHTTPContextFunc, your own
 	// middleware). The gosdk adapter reads the go-sdk's TokenInfo without it. Only the client app
 	// and scopes are sent (see AuthSummary), never the token or the user.
 	AuthInfo func(ctx context.Context) (clientID string, scopes []string, ok bool)
+
+	// endpoint is set by New (ingest.URL); it isn't an option.
+	endpoint string
 }
 
 // Auth is what's kept of a validated OAuth access token (https://github.com/getagentstats/spec/blob/main/PROTOCOL.md "Sign-in").
@@ -116,7 +123,10 @@ type Event struct {
 	Tool          *string `json:"tool"`
 	DurationMs    float64 `json:"durationMs"`
 	IsError       bool    `json:"isError"`
+	ErrorKind     *string `json:"errorKind,omitempty"`
+	ErrorCode     *int64  `json:"errorCode,omitempty"`
 	ErrorMessage  *string `json:"errorMessage"`
+	ResultChars   *int    `json:"resultChars,omitempty"`
 	ClientName    *string `json:"clientName"`
 	ClientVersion *string `json:"clientVersion"`
 	SessionID     *string `json:"sessionId"`
@@ -158,6 +168,7 @@ type Tracker struct {
 	catalogDirty bool
 	sessions     map[string]clientInfo
 	auths        map[string]*Auth
+	feedback     []Feedback
 	dropped      int64
 
 	inflight atomic.Int32
@@ -171,12 +182,7 @@ func New(opts Options) *Tracker {
 	if opts.APIKey == "" {
 		opts.APIKey = os.Getenv("AGENTSTATS_MCP_KEY")
 	}
-	if opts.Endpoint == "" {
-		opts.Endpoint = os.Getenv("AGENTSTATS_ENDPOINT")
-	}
-	if opts.Endpoint == "" {
-		opts.Endpoint = defaultEndpoint
-	}
+	opts.endpoint = ingest.URL("mcp")
 	if opts.SampleRate <= 0 || opts.SampleRate > 1 {
 		opts.SampleRate = 1
 	}
@@ -318,8 +324,14 @@ type Call struct {
 	Method, Tool, SessionID string
 	Started                 time.Time
 	IsError                 bool
-	ErrorMessage            string
-	Err                     error // the error the handler returned, if any
+	// ErrorKind is "tool" for an isError result, "protocol" for a JSON-RPC error (with ErrorCode).
+	ErrorKind    string
+	ErrorCode    *int64
+	ErrorMessage string
+	Err          error // the error the handler returned, if any
+	// ResultChars is the characters of text a successful tools/call, resources/read or prompts/get
+	// result handed the model; nil when the adapter didn't measure it.
+	ResultChars *int
 	// Client identity, when the adapter knows it. Otherwise it is looked up by session.
 	ClientName, ClientVersion string
 	// Auth is the request's sign-in summary (AuthSummary), if it carried a validated token.
@@ -353,6 +365,21 @@ func (t *Tracker) Record(c Call) {
 	}
 	if c.Tool != "" {
 		e.Tool = &c.Tool
+	}
+	if c.IsError {
+		kind := c.ErrorKind
+		if kind == "" {
+			kind = "tool"
+			if c.Err != nil {
+				kind = "protocol"
+			}
+		}
+		e.ErrorKind = &kind
+		if kind == "protocol" {
+			e.ErrorCode = c.ErrorCode
+		}
+	} else if c.ResultChars != nil && ContentMethods[c.Method] {
+		e.ResultChars = c.ResultChars
 	}
 	if c.SessionID != "" {
 		e.SessionID = &c.SessionID
@@ -426,7 +453,7 @@ func (t *Tracker) Flush(ctx context.Context) error {
 		return nil
 	}
 	t.mu.Lock()
-	if len(t.buf) == 0 && !t.catalogDirty {
+	if len(t.buf) == 0 && !t.catalogDirty && len(t.feedback) == 0 {
 		t.mu.Unlock()
 		return nil
 	}
@@ -434,6 +461,8 @@ func (t *Tracker) Flush(ctx context.Context) error {
 	events := make([]Event, n)
 	copy(events, t.buf[:n])
 	t.buf = t.buf[n:]
+	fb := t.feedback[:min(len(t.feedback), 50)]
+	t.feedback = t.feedback[len(fb):]
 	var cat *catalog
 	if t.catalogDirty {
 		c := *t.catalog
@@ -450,7 +479,7 @@ func (t *Tracker) Flush(ctx context.Context) error {
 
 	t.inflight.Add(1)
 	defer t.inflight.Add(-1)
-	err := t.send(ctx, name, events, cat, dropped)
+	err := t.send(ctx, name, events, cat, fb, dropped)
 	if err != nil {
 		t.mu.Lock()
 		t.dropped += dropped + int64(len(events))
@@ -463,16 +492,19 @@ func (t *Tracker) Flush(ctx context.Context) error {
 	return err
 }
 
-func (t *Tracker) send(ctx context.Context, name string, events []Event, cat *catalog, dropped int64) error {
+func (t *Tracker) send(ctx context.Context, name string, events []Event, cat *catalog, fb []Feedback, dropped int64) error {
 	payload := map[string]any{"serverName": name, "events": events, "dropped": dropped}
 	if cat != nil {
 		payload["catalog"] = cat
+	}
+	if len(fb) > 0 {
+		payload["feedback"] = fb
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.opts.Endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.opts.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -503,7 +535,7 @@ func (t *Tracker) Shutdown(ctx context.Context) error {
 	}
 	for {
 		t.mu.Lock()
-		left := len(t.buf) > 0 || t.catalogDirty
+		left := len(t.buf) > 0 || t.catalogDirty || len(t.feedback) > 0
 		t.mu.Unlock()
 		if !left {
 			return nil
@@ -524,4 +556,88 @@ func (t *Tracker) Dropped() int64 {
 // LocalSessionID returns a random id for transports without sessions (stdio).
 func LocalSessionID() string {
 	return fmt.Sprintf("%010x", rand.Uint64()>>24)
+}
+
+// ContentMethods are the requests whose result is content handed to the model, so its size is its context cost.
+var ContentMethods = map[string]bool{"tools/call": true, "resources/read": true, "prompts/get": true}
+
+// FeedbackToolName is the tool Options.FeedbackTool adds (PROTOCOL.md, "Feedback").
+const FeedbackToolName = "send_feedback"
+
+// FeedbackToolTitle, FeedbackToolDescription, FeedbackInputSchema and FeedbackReply define the
+// send_feedback tool exactly as the spec does, for adapters to list and answer it.
+const (
+	FeedbackToolTitle       = "Send feedback"
+	FeedbackToolDescription = "Send feedback about this server to the people who build it. Use it when a tool failed, returned something wrong or unhelpful, or when you could not do what the user needed with these tools; or when the user asks you to pass something on. Describe what you tried and what you expected in a few sentences. Leave out personal information, secrets and the user's data."
+	FeedbackReply           = "Thanks: your feedback was sent to the developers of this server."
+	FeedbackEmptyReply      = "Nothing was sent: `content` is empty."
+)
+
+// FeedbackInputSchema returns the send_feedback input schema (a fresh map each call).
+func FeedbackInputSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"content": map[string]any{"type": "string", "description": "What happened and what you expected, in a few sentences."},
+			"source":  map[string]any{"type": "string", "enum": []string{"user", "agent"}, "description": `"user" when the user asked you to send it, "agent" when you are reporting on your own.`},
+			"tool":    map[string]any{"type": "string", "description": "The tool it is about, if it is about one."},
+		},
+		"required": []string{"content", "source"},
+	}
+}
+
+// Feedback is one send_feedback call, as sent with a batch.
+type Feedback struct {
+	Ts            int64   `json:"ts"`
+	SessionID     *string `json:"sessionId"`
+	ClientName    *string `json:"clientName"`
+	ClientVersion *string `json:"clientVersion"`
+	Source        string  `json:"source"`
+	Tool          *string `json:"tool"`
+	Content       string  `json:"content"`
+}
+
+// FeedbackEnabled says whether adapters should add send_feedback.
+func (t *Tracker) FeedbackEnabled() bool { return t != nil && t.Enabled() && t.opts.FeedbackTool }
+
+// RecordFeedback queues what a send_feedback call said (args are its arguments). It returns false
+// when there's nothing to keep (empty content), so the adapter answers with FeedbackEmptyReply.
+func (t *Tracker) RecordFeedback(args map[string]any, sessionID, clientName, clientVersion string) bool {
+	content, _ := args["content"].(string)
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+	if len(content) > 4000 {
+		content = content[:4000]
+	}
+	f := Feedback{Ts: time.Now().UnixMilli(), Source: "agent", Content: content}
+	if s, _ := args["source"].(string); s == "user" {
+		f.Source = "user"
+	}
+	if tool, _ := args["tool"].(string); tool != "" {
+		if len(tool) > 200 {
+			tool = tool[:200]
+		}
+		f.Tool = &tool
+	}
+	if sessionID != "" {
+		f.SessionID = &sessionID
+	}
+	t.mu.Lock()
+	if clientName == "" {
+		if ci, ok := t.sessions[sessionID]; ok {
+			clientName, clientVersion = ci.name, ci.version
+		}
+	}
+	if clientName != "" {
+		f.ClientName, f.ClientVersion = &clientName, &clientVersion
+	}
+	if len(t.feedback) >= 100 {
+		t.feedback = t.feedback[1:]
+	}
+	t.feedback = append(t.feedback, f)
+	t.mu.Unlock()
+	t.once.Do(func() { go t.loop() })
+	return true
 }

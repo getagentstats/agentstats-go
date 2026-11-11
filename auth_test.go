@@ -36,7 +36,8 @@ func TestGoSDKOAuthSignIn(t *testing.T) {
 	mcp.AddTool(s, &mcp.Tool{Name: "search", Description: "Search."}, func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, any, error) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil, nil
 	})
-	tr := gosdk.Instrument(s, agentstats.Options{APIKey: "al_srv_test", Endpoint: cap.srv.URL, FlushInterval: time.Hour})
+	t.Setenv("AGENTSTATS_URL", cap.srv.URL)
+	tr := gosdk.Instrument(s, agentstats.Options{APIKey: "al_srv_test", FlushInterval: time.Hour})
 
 	tokens := map[string]*auth.TokenInfo{
 		"tok-claude": {Scopes: []string{"mcp:tools", "mcp:read", "mcp:read"}, Expiration: time.Now().Add(time.Hour), UserID: "user-42", Extra: map[string]any{"client_id": "https://claude.ai/oauth/mcp-client-metadata.json", "email": "ada@example.com"}},

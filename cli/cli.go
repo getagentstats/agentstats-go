@@ -35,10 +35,11 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"agentstats.io/go/internal/ingest"
 )
 
 const Version = "0.1.0"
-const defaultEndpoint = "https://agentstats.io/api/ingest/cli"
 const maxSpoolBytes = 512 * 1024
 
 // sendEnv marks the background run that sends a spool instead of running the CLI.
@@ -49,8 +50,7 @@ type Options struct {
 	CLI     string // your CLI's name, e.g. "acme"
 	Version string // shown per command in the dashboard
 	// APIKey defaults to AGENTSTATS_CLI_KEY. Without a key the tracker is a no-op.
-	APIKey   string
-	Endpoint string // AGENTSTATS_CLI_ENDPOINT
+	APIKey string
 	// PublishKey (al_sec_…, release CI only) replaces the command list on the dashboard before
 	// the process exits. Defaults to AGENTSTATS_CLI_PUBLISH_KEY. Never ship it.
 	PublishKey string
@@ -71,6 +71,9 @@ type Options struct {
 	Dir         string // AGENTSTATS_CLI_DIR, else ~/.cache/agentstats (or $TMPDIR/agentstats)
 	Disabled    bool
 	Debug       bool // AGENTSTATS_DEBUG=1
+
+	// endpoint is set by New (ingest.URL); it isn't an option.
+	endpoint string
 }
 
 // ErrorInfo is a failed command, as passed to Options.ErrorText.
@@ -156,9 +159,7 @@ func New(opts Options) *Tracker {
 	if opts.APIKey == "" {
 		opts.APIKey = os.Getenv("AGENTSTATS_CLI_KEY")
 	}
-	if opts.Endpoint == "" {
-		opts.Endpoint = envOr("AGENTSTATS_CLI_ENDPOINT", defaultEndpoint)
-	}
+	opts.endpoint = ingest.URL("cli")
 	if opts.PublishKey == "" {
 		opts.PublishKey = os.Getenv("AGENTSTATS_CLI_PUBLISH_KEY")
 	}
@@ -469,7 +470,7 @@ func (t *Tracker) publishCatalog() {
 		return
 	}
 	b, _ := json.Marshal(map[string]any{"cli": t.opts.CLI, "events": []any{}, "catalog": map[string]any{"version": strPtr(t.opts.Version), "commands": t.catalog}})
-	req, _ := http.NewRequest("POST", t.opts.Endpoint, bytes.NewReader(b))
+	req, _ := http.NewRequest("POST", t.opts.endpoint, bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+t.opts.APIKey)
 	req.Header.Set("X-AgentStats-Publish-Key", t.opts.PublishKey)
@@ -499,7 +500,7 @@ func (t *Tracker) spawnSender(spool string) error {
 	}
 	os.WriteFile(lock, []byte(fmt.Sprint(time.Now().UnixMilli())), 0o644)
 	cmd := exec.Command(exe)
-	cmd.Env = append(os.Environ(), sendEnv+"="+spool, "AGENTSTATS_SEND_ENDPOINT="+t.opts.Endpoint, "AGENTSTATS_SEND_KEY="+t.opts.APIKey, "AGENTSTATS_SEND_DEBUG="+boolEnv(t.opts.Debug))
+	cmd.Env = append(os.Environ(), sendEnv+"="+spool, "AGENTSTATS_SEND_ENDPOINT="+t.opts.endpoint, "AGENTSTATS_SEND_KEY="+t.opts.APIKey, "AGENTSTATS_SEND_DEBUG="+boolEnv(t.opts.Debug))
 	if t.opts.Debug {
 		cmd.Stderr = os.Stderr
 	}

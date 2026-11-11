@@ -95,7 +95,8 @@ func newGoSDK(opts agentstats.Options) (*mcp.ClientSession, *agentstats.Tracker)
 func TestGoSDKRecords(t *testing.T) {
 	cap := newCapture(0)
 	defer cap.srv.Close()
-	cs, tr := newGoSDK(agentstats.Options{APIKey: "al_srv_test", Endpoint: cap.srv.URL, FlushInterval: time.Hour})
+	t.Setenv("AGENTSTATS_URL", cap.srv.URL)
+	cs, tr := newGoSDK(agentstats.Options{APIKey: "al_srv_test", FlushInterval: time.Hour})
 	ctx := context.Background()
 	if _, err := cs.ListTools(ctx, nil); err != nil {
 		t.Fatal(err)
@@ -147,7 +148,8 @@ func callMcpGo(c *mcpgoclient.Client, name string, args map[string]any) {
 func TestMcpGoRecords(t *testing.T) {
 	cap := newCapture(0)
 	defer cap.srv.Close()
-	c, tr := newMcpGo(agentstats.Options{APIKey: "al_srv_test", Endpoint: cap.srv.URL, FlushInterval: time.Hour})
+	t.Setenv("AGENTSTATS_URL", cap.srv.URL)
+	c, tr := newMcpGo(agentstats.Options{APIKey: "al_srv_test", FlushInterval: time.Hour})
 	ctx := context.Background()
 	if _, err := c.ListTools(ctx, mcpgo.ListToolsRequest{}); err != nil {
 		t.Fatal(err)
@@ -190,7 +192,8 @@ func assertRecorded(t *testing.T, events []map[string]any, catalog map[string]an
 func TestSlowEndpointNeverBlocks(t *testing.T) {
 	cap := newCapture(3 * time.Second)
 	defer cap.srv.Close()
-	cs, _ := newGoSDK(agentstats.Options{APIKey: "al_srv_test", Endpoint: cap.srv.URL, FlushInterval: 10 * time.Millisecond, MaxBatch: 1})
+	t.Setenv("AGENTSTATS_URL", cap.srv.URL)
+	cs, _ := newGoSDK(agentstats.Options{APIKey: "al_srv_test", FlushInterval: 10 * time.Millisecond, MaxBatch: 1})
 	start := time.Now()
 	for i := 0; i < 50; i++ {
 		cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "add", Arguments: map[string]any{"a": i, "b": 1}})
@@ -201,7 +204,8 @@ func TestSlowEndpointNeverBlocks(t *testing.T) {
 }
 
 func TestDeadEndpointBoundsBuffer(t *testing.T) {
-	cs, tr := newGoSDK(agentstats.Options{APIKey: "al_srv_test", Endpoint: "http://127.0.0.1:1", FlushInterval: time.Hour, MaxBuffer: 100, MaxBatch: 100000})
+	t.Setenv("AGENTSTATS_URL", "http://127.0.0.1:1")
+	cs, tr := newGoSDK(agentstats.Options{APIKey: "al_srv_test", FlushInterval: time.Hour, MaxBuffer: 100, MaxBatch: 100000})
 	for i := 0; i < 300; i++ {
 		cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "add", Arguments: map[string]any{"a": 1, "b": 1}})
 	}
@@ -221,7 +225,8 @@ func TestNoKeyIsNoop(t *testing.T) {
 // ---------- overhead ----------
 
 func benchGoSDK(b *testing.B, instrumented bool) {
-	opts := agentstats.Options{Endpoint: "http://127.0.0.1:1", FlushInterval: time.Hour}
+	b.Setenv("AGENTSTATS_URL", "http://127.0.0.1:1")
+	opts := agentstats.Options{FlushInterval: time.Hour}
 	if instrumented {
 		opts.APIKey = "al_srv_bench"
 	} else {
@@ -243,7 +248,8 @@ func TestErrorTextDecidesWhatIsKept(t *testing.T) {
 	errorsWith := func(opts agentstats.Options) []map[string]any {
 		cap := newCapture(0)
 		defer cap.srv.Close()
-		opts.APIKey, opts.Endpoint, opts.FlushInterval = "al_srv_test", cap.srv.URL, time.Hour
+		t.Setenv("AGENTSTATS_URL", cap.srv.URL)
+		opts.APIKey, opts.FlushInterval = "al_srv_test", time.Hour
 		cs, tr := newGoSDK(opts)
 		ctx := context.Background()
 		cs.CallTool(ctx, &mcp.CallToolParams{Name: "fail", Arguments: map[string]any{}})

@@ -29,15 +29,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"agentstats.io/go/internal/ingest"
 )
 
 const Version = "0.1.0"
-const defaultEndpoint = "https://agentstats.io/api/ingest/api"
 
 // Options configure a Tracker. Zero values fall back to environment variables and defaults.
 type Options struct {
-	APIKey   string // AGENTSTATS_API_KEY
-	Endpoint string // AGENTSTATS_API_ENDPOINT, else AGENTSTATS_ENDPOINT with /hits → /api
+	APIKey string // AGENTSTATS_API_KEY
 	// Routes says which requests are API calls. Default: all of them, or with ServesPages only
 	// paths under /api and /v1, /v2…
 	Routes      func(path string) bool
@@ -56,6 +56,9 @@ type Options struct {
 	MaxBuffer     int           // default 10000
 	Debug         bool          // AGENTSTATS_DEBUG=1
 	HTTPClient    *http.Client
+
+	// endpoint is set by New (ingest.URL); it isn't an option.
+	endpoint string
 }
 
 var (
@@ -120,15 +123,7 @@ func New(o Options) *Tracker {
 	if o.APIKey == "" {
 		o.APIKey = os.Getenv("AGENTSTATS_API_KEY")
 	}
-	if o.Endpoint == "" {
-		o.Endpoint = os.Getenv("AGENTSTATS_API_ENDPOINT")
-	}
-	if o.Endpoint == "" && os.Getenv("AGENTSTATS_ENDPOINT") != "" {
-		o.Endpoint = regexp.MustCompile(`/(hits|mcp)/?$`).ReplaceAllString(os.Getenv("AGENTSTATS_ENDPOINT"), "/api")
-	}
-	if o.Endpoint == "" {
-		o.Endpoint = defaultEndpoint
-	}
+	o.endpoint = ingest.URL("api")
 	if o.FlushInterval <= 0 {
 		o.FlushInterval = 5 * time.Second
 	}
@@ -401,7 +396,7 @@ func (t *Tracker) Flush(ctx context.Context) error {
 		calls = []Call{}
 	}
 	body, _ := json.Marshal(map[string]any{"calls": calls, "other": other})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.opts.Endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.opts.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

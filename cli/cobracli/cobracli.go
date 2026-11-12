@@ -9,7 +9,8 @@
 //
 // It records the command that ran ("db migrate"), help (--help, `help <command>`, a group
 // without a Run), unknown commands, flag errors and the error a RunE returned, and sends the
-// command list. cobra's own output and behaviour don't change.
+// command list. cobra's own output and behaviour don't change. It also adds the feedback command
+// (cli.Options.NoFeedback turns it off) unless root has a command of that name.
 package cobracli
 
 import (
@@ -35,6 +36,7 @@ func Execute(stats *cli.Tracker, root *cobra.Command) error {
 	if !stats.Enabled() {
 		return root.Execute()
 	}
+	addFeedback(stats, root)
 	stats.Commands(Commands(root, stats.CLI()))
 	cmd, err := root.ExecuteC()
 	record(stats, root, cmd, err)
@@ -83,6 +85,36 @@ func record(stats *cli.Tracker, root, cmd *cobra.Command, err error) {
 		stats.Command(Path(cmd))
 		stats.Error(err)
 	}
+}
+
+// feedbackAnnotation marks the feedback command, so the command list leaves it out.
+const feedbackAnnotation = "agentstats-feedback"
+
+// addFeedback adds the feedback command to root, unless it's off or root has a command (or alias) of that name.
+func addFeedback(stats *cli.Tracker, root *cobra.Command) {
+	name := stats.FeedbackName()
+	if name == "" {
+		return
+	}
+	for _, c := range root.Commands() {
+		if c.Name() == name || c.HasAlias(name) {
+			return
+		}
+	}
+	var command, from string
+	cmd := &cobra.Command{
+		Use:         name + " [message...]",
+		Short:       cli.FeedbackSummary,
+		Long:        cli.FeedbackDescription,
+		Annotations: map[string]string{feedbackAnnotation: "true"},
+		Run: func(_ *cobra.Command, args []string) {
+			stats.RunFeedbackWith(cli.FeedbackArgs{Message: strings.Join(args, " "), Command: command, From: from})
+		},
+	}
+	cmd.Flags().StringVar(&command, "command", "", cli.FeedbackHelp.Command)
+	cmd.Flags().StringVar(&from, "from", "", cli.FeedbackHelp.From)
+	root.AddCommand(cmd)
+	stats.MarkFeedbackCommand()
 }
 
 // unknownBelow is the word typed after a group's path, if any: `shipit db push` → "push".
@@ -147,7 +179,7 @@ func Commands(root *cobra.Command, cliName string) []cli.CommandSpec {
 	}
 	walk = func(c *cobra.Command) {
 		for _, sub := range c.Commands() {
-			if sub.Hidden || (c == root && (sub.Name() == "help" || sub.Name() == "completion")) {
+			if sub.Hidden || sub.Annotations[feedbackAnnotation] != "" || (c == root && (sub.Name() == "help" || sub.Name() == "completion")) {
 				continue
 			}
 			if sub.Runnable() {

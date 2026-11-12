@@ -1,10 +1,12 @@
 module agentstats.io/go
 
-go 1.27.2
+go 1.25.5
 
 require (
 	github.com/mark3labs/mcp-go v1.5.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
+	github.com/spf13/cobra v1.10.2
+	github.com/spf13/pflag v1.0.9
 )
 
 require (
@@ -15,8 +17,6 @@ require (
 	github.com/segmentio/asm v1.1.3 // indirect
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/spf13/cast v1.7.1 // indirect
-	github.com/spf13/cobra v1.10.2 // indirect
-	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect

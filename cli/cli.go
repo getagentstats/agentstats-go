@@ -11,6 +11,10 @@
 //
 //	func main() {
 //		stats := cli.New(cli.Options{CLI: "acme", Version: version}) // first thing in main
+//		stats.MarkFeedbackCommand() // you answer it: failed commands hint at it
+//		if len(os.Args) > 1 && os.Args[1] == stats.FeedbackName() {
+//			stats.RunFeedback(os.Args[2:]) // the feedback command; exits
+//		}
 //		stats.Command("deploy")
 //		err := deploy()
 //		stats.Error(err)
@@ -39,7 +43,7 @@ import (
 	"agentstats.io/go/internal/ingest"
 )
 
-const Version = "0.1.0"
+const Version = "0.2.0"
 const maxSpoolBytes = 512 * 1024
 
 // sendEnv marks the background run that sends a spool instead of running the CLI.
@@ -66,6 +70,17 @@ type Options struct {
 	ErrorText func(ErrorInfo) string
 	// FlagNames decides which flag names are sent; return nil for none.
 	FlagNames func(command string, flags []string) []string
+	// NoFeedback turns off the feedback command: `acme feedback "what happened" [--command deploy]
+	// [--from user]`, which agents run when a command fails them or can't do what the user needs, and
+	// users ask their agent to run to pass something on. The SDK answers it (it isn't recorded as a
+	// command) and the text shows on the CLI's Feedback page. cobracli adds it to your commands unless
+	// you have one of that name; without cobra, route it to RunFeedback.
+	NoFeedback bool
+	// FeedbackName names the feedback command. Default "feedback".
+	FeedbackName string
+	// NoFeedbackHint stops the one line on stderr, the first time a command an agent runs fails in a
+	// session, saying the feedback command is there.
+	NoFeedbackHint bool
 	// SessionIdle groups commands by the same actor in the same directory. Default 30 minutes.
 	SessionIdle time.Duration
 	Dir         string // AGENTSTATS_CLI_DIR, else ~/.cache/agentstats (or $TMPDIR/agentstats)
@@ -132,22 +147,53 @@ type Event struct {
 	Runtime      string   `json:"runtime"`
 }
 
+// Feedback is what an agent or its user said through the feedback command, as written to the spool
+// (Type "feedback" sets it apart from commands) and sent as the batch's feedback.
+type Feedback struct {
+	Type         string  `json:"type"`
+	Ts           int64   `json:"ts"`
+	CLI          string  `json:"cli"`
+	SessionID    string  `json:"sessionId"`
+	Agent        string  `json:"agent"`
+	AgentVersion *string `json:"agentVersion"`
+	Source       string  `json:"source"` // "user" or "agent"
+	Command      *string `json:"command"`
+	Content      string  `json:"content"`
+}
+
+// FeedbackSummary is the feedback command's line in a command list.
+const FeedbackSummary = "Tell the developers of this CLI when a command fails you or can't do what you need"
+
+// FeedbackDescription is the feedback command's description, as agents read it in its help.
+const FeedbackDescription = "Send feedback to the developers of this CLI. Use it when a command failed, did something unexpected or unhelpful, or could not do what the user needed; or when the user asks you to pass something on. Say what you ran, what happened and what you expected. Leave out personal information, secrets and the user's data."
+
+// FeedbackHelp is the help text of the feedback command's message and options.
+var FeedbackHelp = struct{ Message, Command, From string }{
+	Message: "What you ran, what happened and what you expected, in a few sentences",
+	Command: `The command it is about, e.g. "deploy"`,
+	From:    `"user" when the user asked you to send it, "agent" (default) when you report on your own`,
+}
+
 // Tracker records the one command a CLI run executes. Safe to use when disabled: every method is a no-op.
 type Tracker struct {
-	opts     Options
-	enabled  bool
-	actor    Actor
-	started  time.Time
-	name     string
-	flags    []string
-	unknown  bool
-	help     bool
-	err      error
-	done     bool
-	catalog  []CommandSpec
-	dirs     []string
-	dir      string
-	sendExec func() (string, error)
+	opts    Options
+	enabled bool
+	actor   Actor
+	started time.Time
+	name    string
+	flags   []string
+	unknown bool
+	help    bool
+	err     error
+	done    bool
+	// notCommand: the feedback command ran, or feedback was sent; the run isn't recorded as a command.
+	notCommand bool
+	// feedbackAdded: the CLI answers the feedback command (MarkFeedbackCommand); only then does a failure hint at it.
+	feedbackAdded bool
+	catalog       []CommandSpec
+	dirs          []string
+	dir           string
+	sendExec      func() (string, error)
 }
 
 // New creates the tracker. Call it first thing in main: when the CLI was started in the
@@ -188,6 +234,122 @@ func New(opts Options) *Tracker {
 	}
 	t.showNotice()
 	return t
+}
+
+// FeedbackName is the feedback command's name, or "" when Options.NoFeedback is set.
+func (t *Tracker) FeedbackName() string {
+	if t.opts.NoFeedback {
+		return ""
+	}
+	return or(strings.TrimSpace(t.opts.FeedbackName), "feedback")
+}
+
+// Feedback queues feedback about the CLI, sent in the background like commands. RunFeedback calls
+// it; call it yourself to send feedback from a command of your own. from is "user" or "agent";
+// command, the command it's about, may be "". False when nothing was queued (no text, or disabled).
+func (t *Tracker) Feedback(message, command, from string) bool {
+	if !t.enabled {
+		return false
+	}
+	content := strings.TrimSpace(message)
+	if content == "" {
+		return false
+	}
+	if len(content) > 4000 {
+		content = content[:4000]
+	}
+	if from != "user" {
+		from = "agent"
+	}
+	var cmd *string
+	if c := SafeCommandName(command); command != "" && c != "(invalid)" {
+		cmd = &c
+	}
+	now := time.Now()
+	f := Feedback{Type: "feedback", Ts: now.UnixMilli(), CLI: t.opts.CLI, Agent: t.actor.Agent, AgentVersion: strPtr(t.actor.Version), Source: from, Command: cmd, Content: content}
+	if !t.appendLine(&f.SessionID, &f, now) {
+		return false
+	}
+	t.notCommand = true
+	return true
+}
+
+// MarkFeedbackCommand says the CLI answers the feedback command, so a failed command an agent runs
+// hints at it. cobracli calls it when it adds the command; call it yourself when you route it to RunFeedback.
+func (t *Tracker) MarkFeedbackCommand() { t.feedbackAdded = true }
+
+// FeedbackArgs is what the feedback command was given.
+type FeedbackArgs struct {
+	Message, Command, From string
+	Help                   bool
+}
+
+// ParseFeedbackArgs reads the feedback command's arguments (after its name): the words are the
+// message; --command <name> and --from <who> (or --command=name) the options; -- ends options.
+func ParseFeedbackArgs(args []string) FeedbackArgs {
+	var out FeedbackArgs
+	words := []string{}
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			words = append(words, args[i+1:]...)
+			break
+		}
+		flag, value, inline := a, "", false
+		if strings.HasPrefix(a, "--") {
+			if k, v, ok := strings.Cut(a, "="); ok {
+				flag, value, inline = k, v, true
+			}
+		}
+		switch flag {
+		case "--help", "-h":
+			out.Help = true
+		case "--command", "--from":
+			if !inline && i+1 < len(args) {
+				i++
+				value = args[i]
+			}
+			if flag == "--command" {
+				out.Command = value
+			} else {
+				out.From = value
+			}
+		default:
+			words = append(words, a)
+		}
+	}
+	out.Message = strings.Join(words, " ")
+	return out
+}
+
+// RunFeedback runs the feedback command: queues what was given, prints the outcome and exits.
+// cobracli calls it; without cobra, route your feedback command here: stats.RunFeedback(os.Args[2:]).
+func (t *Tracker) RunFeedback(args []string) {
+	t.RunFeedbackWith(ParseFeedbackArgs(args))
+}
+
+// RunFeedbackWith is RunFeedback with the arguments already parsed.
+func (t *Tracker) RunFeedbackWith(a FeedbackArgs) {
+	t.notCommand = true
+	name := or(t.FeedbackName(), "feedback")
+	switch {
+	case a.Help:
+		fmt.Fprintf(os.Stdout, "Usage: %s %s \"<message>\" [--command <name>] [--from user|agent]\n\n%s\n", t.opts.CLI, name, FeedbackDescription)
+		t.Exit(0)
+	case !t.enabled:
+		fmt.Fprintf(os.Stderr, "Nothing was sent: %s's usage data is turned off on this machine.\n", t.opts.CLI)
+		os.Exit(1)
+	case !t.Feedback(a.Message, a.Command, a.From):
+		if strings.TrimSpace(a.Message) == "" {
+			fmt.Fprintf(os.Stderr, "Nothing was sent: say what you ran, what happened and what you expected, e.g. %s %s \"…\"\n", t.opts.CLI, name)
+		} else {
+			fmt.Fprintln(os.Stderr, "Nothing was sent: it could not be saved.")
+		}
+		t.Exit(1)
+	default:
+		fmt.Fprintf(os.Stdout, "Thanks: your feedback is on its way to the developers of %s.\n", t.opts.CLI)
+		t.Exit(0)
+	}
 }
 
 // Enabled reports whether events are recorded (a key is set and the user hasn't opted out).
@@ -322,44 +484,41 @@ func (t *Tracker) Finish(exitCode int) {
 		}
 	}()
 	now := time.Now()
-	e := Event{
-		Ts:           now.UnixMilli(),
-		CLI:          t.opts.CLI,
-		CLIVersion:   strPtr(t.opts.Version),
-		Command:      or(t.name, t.opts.CLI),
-		ExitCode:     exitCode,
-		DurationMs:   now.Sub(t.started).Milliseconds(),
-		Unknown:      t.unknown,
-		Help:         t.help,
-		Agent:        t.actor.Agent,
-		AgentVersion: strPtr(t.actor.Version),
-		Via:          strPtr(t.actor.Via),
-		CI:           strPtr(t.actor.CI),
-		OS:           goosName(),
-		Arch:         goarchName(),
-		Runtime:      "go/" + strings.TrimPrefix(runtime.Version(), "go"),
-	}
-	e.Flags = t.flagNames(e.Command)
-	if exitCode != 0 || t.unknown {
-		if msg := t.errorText(e.Command, exitCode); msg != "" {
-			e.ErrorMessage = &msg
+	if !t.notCommand {
+		e := Event{
+			Ts:           now.UnixMilli(),
+			CLI:          t.opts.CLI,
+			CLIVersion:   strPtr(t.opts.Version),
+			Command:      or(t.name, t.opts.CLI),
+			ExitCode:     exitCode,
+			DurationMs:   now.Sub(t.started).Milliseconds(),
+			Unknown:      t.unknown,
+			Help:         t.help,
+			Agent:        t.actor.Agent,
+			AgentVersion: strPtr(t.actor.Version),
+			Via:          strPtr(t.actor.Via),
+			CI:           strPtr(t.actor.CI),
+			OS:           goosName(),
+			Arch:         goarchName(),
+			Runtime:      "go/" + strings.TrimPrefix(runtime.Version(), "go"),
 		}
-	}
-	spoolName := "spool-" + hash(t.opts.APIKey) + ".jsonl"
-	for _, dir := range t.dirs {
-		t.dir = dir
-		if err := t.write(&e, now, spoolName); err != nil {
-			t.log("cannot write to", dir, err)
-			continue
+		e.Flags = t.flagNames(e.Command)
+		if exitCode != 0 || t.unknown {
+			if msg := t.errorText(e.Command, exitCode); msg != "" {
+				e.ErrorMessage = &msg
+			}
 		}
-		break
+		t.appendLine(&e.SessionID, &e, now)
+		if exitCode != 0 && !t.help && e.SessionID != "" {
+			t.showFeedbackHint(e.SessionID)
+		}
 	}
 	t.publishCatalog()
 	if truthy(os.Getenv("CODEX_SANDBOX_NETWORK_DISABLED")) {
 		return
 	}
 	for _, dir := range t.dirs {
-		spool := filepath.Join(dir, spoolName)
+		spool := filepath.Join(dir, t.spoolName())
 		if !exists(spool) && !exists(spool+".catalog.json") {
 			continue
 		}
@@ -369,32 +528,68 @@ func (t *Tracker) Finish(exitCode int) {
 	}
 }
 
-func (t *Tracker) write(e *Event, now time.Time, spoolName string) error {
+func (t *Tracker) spoolName() string { return "spool-" + hash(t.opts.APIKey) + ".jsonl" }
+
+// appendLine appends a command or feedback to the spool in the first directory that can be
+// written (a sandbox may refuse ~/.cache), setting its session id first. False when nothing was written.
+func (t *Tracker) appendLine(sessionID *string, line any, now time.Time) bool {
+	for _, dir := range t.dirs {
+		t.dir = dir
+		ok, err := t.write(sessionID, line, now)
+		if err != nil {
+			t.log("cannot write to", dir, err)
+			continue
+		}
+		return ok
+	}
+	return false
+}
+
+func (t *Tracker) write(sessionID *string, line any, now time.Time) (bool, error) {
 	if err := os.MkdirAll(t.dir, 0o755); err != nil {
-		return err
+		return false, err
 	}
 	id, err := t.session(now)
 	if err != nil {
-		return err
+		return false, err
 	}
-	e.SessionID = id
-	spool := filepath.Join(t.dir, spoolName)
+	*sessionID = id
+	spool := filepath.Join(t.dir, t.spoolName())
+	written := false
 	if st, err := os.Stat(spool); err == nil && st.Size() > maxSpoolBytes {
-		t.log("spool full, dropped", e.Command)
+		t.log("spool full, dropped a line")
 	} else {
-		line, _ := json.Marshal(e)
+		b, _ := json.Marshal(line)
 		f, err := os.OpenFile(spool, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
-			return err
+			return false, err
 		}
-		_, err = f.Write(append(line, '\n'))
+		_, err = f.Write(append(b, '\n'))
 		f.Close()
 		if err != nil {
-			return err
+			return false, err
 		}
+		written = true
 	}
 	t.queueCatalog(spool)
-	return nil
+	return written, nil
+}
+
+// showFeedbackHint: after a failed command an agent ran, once per session, one line on stderr
+// saying the feedback command is there. Never for people, CI or unknown callers.
+func (t *Tracker) showFeedbackHint(sessionID string) {
+	name := t.FeedbackName()
+	if name == "" || !t.feedbackAdded || t.opts.NoFeedbackHint || t.actor.Agent == "human" || t.actor.Agent == "ci" || t.actor.Agent == "unknown" {
+		return
+	}
+	marker := filepath.Join(t.dir, "feedback-hint-"+slug(t.opts.CLI))
+	if b, err := os.ReadFile(marker); err == nil && string(b) == sessionID {
+		return
+	}
+	if os.WriteFile(marker, []byte(sessionID), 0o644) != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\nIf %s got something wrong here, tell its developers: %s %s \"what you ran, what happened, what you expected\"\n", t.opts.CLI, t.opts.CLI, name)
 }
 
 // session: the agent's thread when it exposes one, else the same actor in the same directory with no long gap.
@@ -538,37 +733,54 @@ func runSender(spool string) int {
 	client := &http.Client{Timeout: 10 * time.Second}
 	for round := 0; round < 5; round++ {
 		taken := fmt.Sprintf("%s.%d.sending", spool, os.Getpid())
-		var events []json.RawMessage
+		// Spool lines are commands, or feedback (type "feedback"), which goes in the batch's feedback list.
+		var events, feedback []json.RawMessage
 		took := os.Rename(spool, taken) == nil
 		if took {
 			b, _ := os.ReadFile(taken)
 			for _, l := range bytes.Split(b, []byte("\n")) {
-				if len(bytes.TrimSpace(l)) > 0 && json.Valid(l) {
+				if len(bytes.TrimSpace(l)) == 0 || !json.Valid(l) {
+					continue
+				}
+				var kind struct {
+					Type string `json:"type"`
+				}
+				json.Unmarshal(l, &kind)
+				if kind.Type == "feedback" {
+					feedback = append(feedback, json.RawMessage(l))
+				} else {
 					events = append(events, json.RawMessage(l))
 				}
 			}
 		}
 		catalog := readCatalog()
-		if len(events) == 0 && catalog == nil {
+		if len(events) == 0 && len(feedback) == 0 && catalog == nil {
 			if took {
 				os.Remove(taken)
 			}
 			break
 		}
 		failed := -1
-		for i := 0; (i < len(events) || catalog != nil) && failed < 0; i += 500 {
+		for i := 0; (i < len(events) || catalog != nil || len(feedback) > 0) && failed < 0; i += 500 {
 			batch := events[min(i, len(events)):min(i+500, len(events))]
+			notes := feedback[:min(20, len(feedback))]
 			cli := ""
+			var head struct {
+				CLI string `json:"cli"`
+			}
 			if len(batch) > 0 {
-				var head struct {
-					CLI string `json:"cli"`
-				}
 				json.Unmarshal(batch[0], &head)
 				cli = head.CLI
 			} else if catalog != nil {
 				cli = catalog.CLI
+			} else if len(notes) > 0 {
+				json.Unmarshal(notes[0], &head)
+				cli = head.CLI
 			}
 			body := map[string]any{"cli": cli, "events": batch}
+			if len(notes) > 0 {
+				body["feedback"] = notes
+			}
 			if catalog != nil {
 				body["catalog"] = map[string]any{"version": catalog.Version, "commands": catalog.Commands}
 			}
@@ -584,11 +796,14 @@ func runSender(spool string) int {
 				continue
 			}
 			res.Body.Close()
-			logf("sent %d -> %d", len(batch), res.StatusCode)
+			logf("sent %d + %d feedback -> %d", len(batch), len(notes), res.StatusCode)
 			// 429 is "later", like a 5xx: keep the batch for the next run. A 4xx is final.
 			if res.StatusCode >= 500 || res.StatusCode == 429 {
 				failed = i
-			} else if catalog != nil {
+				continue
+			}
+			feedback = feedback[len(notes):]
+			if catalog != nil {
 				os.WriteFile(spool+".catalog.sent", []byte(catalog.Sig), 0o644)
 				if c := readCatalog(); c != nil && c.Sig == catalog.Sig {
 					os.Remove(pending)
@@ -596,12 +811,15 @@ func runSender(spool string) int {
 				catalog = nil
 			}
 		}
-		if failed >= 0 && len(events) > failed {
-			if f, err := os.OpenFile(spool, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-				for _, e := range events[failed:] {
-					f.Write(append(e, '\n'))
+		if failed >= 0 {
+			back := append(append([]json.RawMessage{}, events[min(failed, len(events)):]...), feedback...)
+			if len(back) > 0 {
+				if f, err := os.OpenFile(spool, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+					for _, e := range back {
+						f.Write(append(e, '\n'))
+					}
+					f.Close()
 				}
-				f.Close()
 			}
 		}
 		if took {

@@ -18,7 +18,7 @@ type exitError struct {
 func (e exitError) ExitCode() int { return e.code }
 
 func main() {
-	stats := cli.New(cli.Options{CLI: "shipit", Version: "1.0.0", NoNotice: true})
+	stats := cli.New(cli.Options{CLI: "shipit", Version: "1.0.0", NoNotice: true, NoFeedback: os.Getenv("FIXTURE_NO_FEEDBACK") == "1"})
 
 	root := &cobra.Command{Use: "shipit", Short: "Deploy and run apps", SilenceUsage: true, Version: "1.0.0"}
 	var env string
